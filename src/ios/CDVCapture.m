@@ -20,6 +20,7 @@
 #import "CDVCapture.h"
 #import "CDVFile.h"
 #import <Cordova/CDVAvailability.h>
+#import <Photos/Photos.h>
 
 #define kW3CMediaFormatHeight @"height"
 #define kW3CMediaFormatWidth @"width"
@@ -538,14 +539,39 @@
 - (void)imagePickerController:(UIImagePickerController*)picker didFinishPickingMediaWithInfo:(NSDictionary*)info
 {
     CDVImagePicker* cameraPicker = (CDVImagePicker*)picker;
+    
     NSString* callbackId = cameraPicker.callbackId;
-
-    [[picker presentingViewController] dismissViewControllerAnimated:YES completion:nil];
-
+    NSString* mediaType = [info objectForKey:UIImagePickerControllerMediaType];
+    
+    if ([mediaType isEqualToString:(NSString*)kUTTypeMovie]) {
+        // process video
+        NSString* moviePath = [(NSURL *)[info objectForKey:UIImagePickerControllerMediaURL] path];
+        
+        // 压缩转码视频
+        [self _exportVideoWithFilePath:moviePath completion:^(NSDictionary *resultDict, NSError *error) {
+            
+            CDVPluginResult* result = nil;
+            [[picker presentingViewController] dismissViewControllerAnimated:YES completion:nil];
+            if (resultDict.count > 0) {
+                NSString *resultPath = resultDict[@"video_path"];
+                result = [self processVideo:resultPath forCallbackId:callbackId];
+            }
+            if (!result) {
+                result = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageToErrorObject:CAPTURE_INTERNAL_ERR];
+            }
+            
+            [self.commandDelegate sendPluginResult:result callbackId:callbackId];
+            self->pickerController = nil;
+        }];
+        
+        return;
+    }
+    
+    
     CDVPluginResult* result = nil;
 
     UIImage* image = nil;
-    NSString* mediaType = [info objectForKey:UIImagePickerControllerMediaType];
+    
     if (!mediaType || [mediaType isEqualToString:(NSString*)kUTTypeImage]) {
         // mediaType is nil then only option is UIImagePickerControllerOriginalImage
         if ([UIImagePickerController respondsToSelector:@selector(allowsEditing)] &&
@@ -555,15 +581,10 @@
             image = [info objectForKey:UIImagePickerControllerOriginalImage];
         }
     }
+    
     if (image != nil) {
         // mediaType was image
         result = [self processImage:image type:cameraPicker.mimeType forCallbackId:callbackId];
-    } else if ([mediaType isEqualToString:(NSString*)kUTTypeMovie]) {
-        // process video
-        NSString* moviePath = [(NSURL *)[info objectForKey:UIImagePickerControllerMediaURL] path];
-        if (moviePath) {
-            result = [self processVideo:moviePath forCallbackId:callbackId];
-        }
     }
     if (!result) {
         result = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageToErrorObject:CAPTURE_INTERNAL_ERR];
@@ -571,6 +592,232 @@
     [self.commandDelegate sendPluginResult:result callbackId:callbackId];
     pickerController = nil;
 }
+
+    
+- (void)_exportVideoWithFilePath:(NSString *)filePath completion:(void (^)(NSDictionary *resultDict, NSError *error))completion
+    {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        BOOL isDir = NO;
+        if ([fm fileExistsAtPath:filePath isDirectory:&isDir] && !isDir) {
+            AVURLAsset *asset = [AVURLAsset assetWithURL:[NSURL fileURLWithPath:filePath]];
+            if (asset.isExportable) {
+                
+                [self _exportVideoWithAsset:asset completion:completion];
+            } else {
+                
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (completion) {
+                        NSError *error = [NSError errorWithDomain:@"" code:0 userInfo:@{NSLocalizedFailureReasonErrorKey:@"视频无法压缩"}];
+                        completion(nil, error);
+                    }
+                });
+            }
+        } else {
+            
+            NSLog(@"文件不存在");
+            if (completion) {
+                completion(nil, [NSError errorWithDomain:@"" code:0 userInfo:@{NSLocalizedFailureReasonErrorKey:@"文件不存在"}]);
+            }
+        }
+    }
+    
+- (void)_exportVideoWithAsset:(AVAsset *)videoAsset completion:(void (^)(NSDictionary *resultDict, NSError *error))completion
+    {
+        NSArray *presets = [AVAssetExportSession exportPresetsCompatibleWithAsset:videoAsset];
+        
+        if (presets.count == 0) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (completion) {
+                    NSError *error = [NSError errorWithDomain:@"" code:0 userInfo:@{NSLocalizedFailureReasonErrorKey:@"无法导出文件"}];
+                    completion(nil, error);
+                }
+            });
+            return;
+        }
+        
+        NSString *presetName = [presets firstObject];
+        if ([presets containsObject:AVAssetExportPresetMediumQuality]) {
+            presetName = AVAssetExportPresetMediumQuality;
+        } else if ([presets containsObject:AVAssetExportPresetLowQuality]) {
+            presetName = AVAssetExportPresetLowQuality;
+        }
+        
+        AVAssetExportSession *exportSession = [[AVAssetExportSession alloc] initWithAsset:videoAsset presetName:presetName];
+        
+        NSArray *supportedFileTypes = exportSession.supportedFileTypes;
+        if (supportedFileTypes.count == 0) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (completion) {
+                    NSError *error = [NSError errorWithDomain:@"" code:0 userInfo:@{NSLocalizedFailureReasonErrorKey:@"无法导出文件"}];
+                    completion(nil, error);
+                }
+            });
+            return;
+        }
+        
+        exportSession.outputFileType = [supportedFileTypes firstObject];
+        if ([supportedFileTypes containsObject:AVFileTypeMPEG4]) {
+            exportSession.outputFileType = AVFileTypeMPEG4;
+        }
+        
+        NSString *randomName = [NSUUID UUID].UUIDString;
+        NSString *fileName = [NSString stringWithFormat:@"%@.mp4", randomName];
+        NSString *outputPath = [NSTemporaryDirectory() stringByAppendingPathComponent:fileName];
+        exportSession.outputURL = [NSURL fileURLWithPath:outputPath];
+        exportSession.shouldOptimizeForNetworkUse = true;
+        
+        AVMutableVideoComposition *videoComposition = [self fixedCompositionWithAsset:videoAsset];
+        if (videoComposition) {
+            // 修正视频转向
+            exportSession.videoComposition = videoComposition;
+        }
+        // 添加视频导出时间范围
+        exportSession.timeRange = CMTimeRangeMake(kCMTimeZero, videoAsset.duration);
+        
+        // Begin to export video to the output path asynchronously.
+        [exportSession exportAsynchronouslyWithCompletionHandler:^{
+            
+            if (exportSession.status == AVAssetExportSessionStatusCompleted) {
+                
+                if ([[NSFileManager defaultManager] fileExistsAtPath:outputPath]) {
+                    NSLog(@"视频导出完成！");
+                    
+                    AVURLAsset *asset = [AVURLAsset assetWithURL:[NSURL fileURLWithPath:outputPath]];
+                    Float64 duration = CMTimeGetSeconds(asset.duration);
+                    
+                    AVAssetTrack *videoTrack = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+                    CGSize videoSize = videoTrack.naturalSize;
+                    
+                    NSDictionary *resultDict = [NSMutableDictionary dictionary];
+                    [resultDict setValue:outputPath forKey:@"video_path"];
+                    [resultDict setValue:@(duration) forKey:@"duration"];
+                    [resultDict setValue:@(videoSize.width) forKey:@"width"];
+                    [resultDict setValue:@(videoSize.height) forKey:@"height"];
+                    
+                    
+                    
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        if (completion) {
+                            completion(resultDict, nil);
+                        }
+                    });
+                    
+                    return;
+                }
+            }
+            
+            dispatch_async(dispatch_get_main_queue(), ^{
+                
+                NSError *error = exportSession.error;
+                if (!error) {
+                    error = [NSError errorWithDomain:@"" code:0 userInfo:@{NSLocalizedFailureReasonErrorKey:@"无法导出文件"}];
+                }
+                if (completion) {
+                    completion(nil, error);
+                }
+            });
+        }];
+    }
+    
+    // 获取视频角度
+- (UIDeviceOrientation)videoOrientationFromVideoAsset:(AVAsset *)asset
+    {
+        UIDeviceOrientation videoOrientation = UIDeviceOrientationPortrait;
+        
+        NSArray *tracks = [asset tracksWithMediaType:AVMediaTypeVideo];
+        if([tracks count] > 0) {
+            
+            AVAssetTrack *videoTrack = [tracks objectAtIndex:0];
+            CGAffineTransform t = videoTrack.preferredTransform;
+            
+            if (t.a == 1 && t.b == 0 && t.c == 0 && t.d == 1) {
+                
+                videoOrientation = UIDeviceOrientationPortrait;
+                
+            } else if (t.a == 0 && t.b == 1 && t.c == -1 && t.d == 0) {
+                
+                videoOrientation = UIDeviceOrientationLandscapeRight;
+                
+            } else if (t.a == -1 && t.b == 0 && t.c == 0 && t.d == -1) {
+                
+                videoOrientation = UIDeviceOrientationPortraitUpsideDown;
+                
+            } else if (t.a == 0 && t.b == -1 && t.c == 1 && t.d == 0) {
+                
+                videoOrientation = UIDeviceOrientationLandscapeLeft;
+            }
+        }
+        
+        return videoOrientation;
+    }
+    
+    // 获取优化后的视频转向信息
+- (AVMutableVideoComposition *)fixedCompositionWithAsset:(AVAsset *)videoAsset
+    {
+        if ([videoAsset tracksWithMediaType:AVMediaTypeVideo].count == 0) {
+            return nil;
+        }
+        
+        AVAssetTrack *videoTrack = [[videoAsset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+        CGAffineTransform mixedTransform;
+        CGFloat renderWidth = 0.0;
+        CGFloat renderHeight = 0.0;
+        
+        UIDeviceOrientation videoOrientation = [self videoOrientationFromVideoAsset:videoAsset];
+        if (videoOrientation == UIDeviceOrientationPortrait) {
+            
+            mixedTransform = CGAffineTransformIdentity;
+            
+            renderWidth = videoTrack.naturalSize.width;
+            renderHeight = videoTrack.naturalSize.height;
+            
+        } else if (videoOrientation == UIDeviceOrientationPortraitUpsideDown) {
+            
+            CGAffineTransform translateToCenter = CGAffineTransformMakeTranslation(videoTrack.naturalSize.width, videoTrack.naturalSize.height);
+            mixedTransform = CGAffineTransformRotate(translateToCenter, M_PI);
+            
+            renderWidth = videoTrack.naturalSize.width;
+            renderHeight = videoTrack.naturalSize.height;
+            
+        } else if (videoOrientation == UIDeviceOrientationLandscapeRight) {
+            
+            CGAffineTransform translateToCenter = CGAffineTransformMakeTranslation(videoTrack.naturalSize.height, 0.0);
+            mixedTransform = CGAffineTransformRotate(translateToCenter, M_PI_2);
+            
+            renderWidth = videoTrack.naturalSize.height;
+            renderHeight = videoTrack.naturalSize.width;
+            
+        } else if (videoOrientation == UIDeviceOrientationLandscapeLeft) {
+            
+            CGAffineTransform translateToCenter = CGAffineTransformMakeTranslation(0.0, videoTrack.naturalSize.width);
+            mixedTransform = CGAffineTransformRotate(translateToCenter, -M_PI_2);
+            
+            renderWidth = videoTrack.naturalSize.height;
+            renderHeight = videoTrack.naturalSize.width;
+            
+        } else {
+            
+            mixedTransform = CGAffineTransformIdentity;
+            
+            renderWidth = videoTrack.naturalSize.width;
+            renderHeight = videoTrack.naturalSize.height;
+        }
+        
+        AVMutableVideoCompositionLayerInstruction *layerInstruction = [AVMutableVideoCompositionLayerInstruction videoCompositionLayerInstructionWithAssetTrack:videoTrack];
+        [layerInstruction setTransform:mixedTransform atTime:kCMTimeZero];
+        
+        AVMutableVideoCompositionInstruction *videoInstruction = [AVMutableVideoCompositionInstruction videoCompositionInstruction];
+        videoInstruction.timeRange = CMTimeRangeMake(kCMTimeZero, videoAsset.duration);
+        videoInstruction.layerInstructions = @[layerInstruction];
+        
+        AVMutableVideoComposition *videoComposition = [AVMutableVideoComposition videoComposition];
+        // 加入视频方向信息
+        videoComposition.instructions = @[videoInstruction];
+        videoComposition.renderSize = CGSizeMake(renderWidth, renderHeight);
+        videoComposition.renderScale = 1.0;
+        videoComposition.frameDuration = CMTimeMake(1, 30);
+        return videoComposition;
+    }
 
 - (void)imagePickerControllerDidCancel:(UIImagePickerController*)picker
 {
